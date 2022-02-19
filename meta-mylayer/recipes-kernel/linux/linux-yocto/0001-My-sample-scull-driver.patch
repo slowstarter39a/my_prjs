@@ -1,0 +1,790 @@
+From e44d4ad95c224beb999fa479c8152308ca7c0a83 Mon Sep 17 00:00:00 2001
+From: OpenEmbedded <oe.patch@oe>
+Date: Sun, 6 Feb 2022 11:58:41 +0000
+Subject: [PATCH] My sample scull driver
+
+Signed-off-by: OpenEmbedded <oe.patch@oe>
+---
+ drivers/Kconfig              |   2 +
+ drivers/Makefile             |   1 +
+ drivers/scull/Kconfig        |   6 +
+ drivers/scull/Makefile       |   3 +
+ drivers/scull/scull.c        | 551 +++++++++++++++++++++++++++++++++++
+ drivers/scull/scull.h        | 113 +++++++
+ drivers/scull/scull_device.c |  46 +++
+ 7 files changed, 722 insertions(+)
+ create mode 100644 drivers/scull/Kconfig
+ create mode 100644 drivers/scull/Makefile
+ create mode 100644 drivers/scull/scull.c
+ create mode 100644 drivers/scull/scull.h
+ create mode 100644 drivers/scull/scull_device.c
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 0d399ddaa185..072a24e32fed 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -236,4 +236,6 @@ source "drivers/interconnect/Kconfig"
+ source "drivers/counter/Kconfig"
+ 
+ source "drivers/most/Kconfig"
++
++source "drivers/scull/Kconfig"
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index a110338c860c..75fa30faa9dd 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -187,3 +187,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
+ obj-$(CONFIG_COUNTER)		+= counter/
+ obj-$(CONFIG_MOST)		+= most/
++obj-$(CONFIG_SCULL)		+= scull/
+diff --git a/drivers/scull/Kconfig b/drivers/scull/Kconfig
+new file mode 100644
+index 000000000000..ae3838d5dde9
+--- /dev/null
++++ b/drivers/scull/Kconfig
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0
++config SCULL
++	tristate "SCULL"
++	default m
++	help
++	  Scull test driver.
+diff --git a/drivers/scull/Makefile b/drivers/scull/Makefile
+new file mode 100644
+index 000000000000..ad6ed7d5a5a1
+--- /dev/null
++++ b/drivers/scull/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_SCULL) += scull.o
++obj-$(CONFIG_SCULL) += scull_device.o
+diff --git a/drivers/scull/scull.c b/drivers/scull/scull.c
+new file mode 100644
+index 000000000000..f34e59892f82
+--- /dev/null
++++ b/drivers/scull/scull.c
+@@ -0,0 +1,551 @@
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include "scull.h"
++#include <linux/slab.h>
++#include <linux/poll.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/sysfs.h>
++#include <linux/kobject.h>
++
++static int scull_major = -1;
++static int scull_minor = 0;
++static int scull_nr_devs = SCULL_NR_DEVS;
++static int scull_quantum = SCULL_QUANTUM;
++static int scull_qset = SCULL_QSET;
++
++#define DEVICE_NAME "scull"
++
++module_param(scull_major, int, S_IRUGO);
++module_param(scull_minor, int, S_IRUGO);
++module_param(scull_nr_devs, int, S_IRUGO);
++module_param(scull_quantum, int, S_IRUGO);
++module_param(scull_qset, int, S_IRUGO);
++
++static bool can_write = false;
++static bool can_read = false;
++static char scull_value[20];
++
++DECLARE_WAIT_QUEUE_HEAD(wait_queue_data);
++#define DELAY (HZ)
++
++struct mutex scull_mutex;
++
++struct scull_dev *scull_devices;
++
++struct kobject *kobj_ref;
++
++struct completion my_completion[SCULL_NR_DEVS];
++bool is_opened[SCULL_NR_DEVS];
++
++
++struct scull_qset *scull_follow(struct scull_dev *dev, int n);
++
++struct timer_data {
++	int value;
++	spinlock_t lock;
++	struct timer_list timer;
++	bool is_active;
++} my_timer_data;
++
++void timer_callback(struct timer_list *timer)
++{
++	struct timer_data *data = from_timer(data, timer, timer);
++
++	data->value++;
++	printk(KERN_INFO "[%s] value is = %d\n", __func__, data->value);
++	spin_lock(&data->lock);
++	if (data->value < 1000)
++		mod_timer(timer, jiffies + DELAY);
++	spin_unlock(&data->lock);
++
++	mutex_lock(&scull_mutex);
++	if (is_opened[data->value % SCULL_NR_DEVS] == true)  {
++		complete(&my_completion[data-> value % SCULL_NR_DEVS]);
++	}
++	mutex_unlock(&scull_mutex);
++
++
++}
++
++int timer_init(void)
++{
++	printk("[%s] creating timer...\n", __func__);
++
++	my_timer_data.is_active = true;
++	spin_lock_init(&my_timer_data.lock);
++	timer_setup(&my_timer_data.timer, timer_callback, 0);
++	mod_timer(&my_timer_data.timer, jiffies + DELAY);
++
++	return 0;
++
++
++}
++
++void timer_exit(void)
++{
++	int ret;
++	spin_lock(&my_timer_data.lock);
++	my_timer_data.is_active = false;
++	ret = del_timer(&my_timer_data.timer);
++	spin_unlock(&my_timer_data.lock);
++
++	printk("[%s] deleting timer..., ret = %d\\n", __func__, ret);
++
++
++}
++
++
++static ssize_t sysfs_show(struct kobject *kobj, struct kobj_attribute *attr,
++		char *buf)
++{
++	pr_info("Sysfs show - Write permission Granted!!!\n");
++	can_write = true;
++
++	wake_up(&wait_queue_data);
++	return sprintf(buf, "%s", "Success\n");
++}
++
++static ssize_t sysfs_store(struct kobject *kobj, struct kobj_attribute *attr,
++		const char *buf, size_t count)
++{
++	pr_info("Ssysfs Store - Read permission Granted!!\n");
++	strcpy(scull_value, buf);
++	can_read = true;
++
++	wake_up(&wait_queue_data);
++
++	return count;
++}
++
++struct kobj_attribute scull_attr = __ATTR(scull_value, 0660, sysfs_show, 
++		sysfs_store);
++
++
++
++ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
++		loff_t *f_pos)
++{
++
++	struct scull_dev *dev = filp->private_data;
++	struct scull_qset *dptr;
++	int quantum = dev->quantum;
++	int qset = dev->qset;
++	int itemsize = quantum * qset;
++	int item, s_pos, q_pos, rest;
++	ssize_t retval = 0;
++
++	char local_buf[100] = {0,};
++	int timer_count = 0;
++
++	int ret = wait_for_completion_interruptible(&my_completion[iminor(file_inode(filp))]);
++	if (ret == -ERESTARTSYS) {
++		return -EINTR;
++	}
++
++	spin_lock(&my_timer_data.lock);
++	timer_count = my_timer_data.value;
++	spin_unlock(&my_timer_data.lock);
++
++	snprintf(buf, sizeof(local_buf), "scull_read(%d) : timer count is %d",
++			iminor(file_inode(filp)), timer_count);
++
++	return sizeof(local_buf);
++
++
++#if 0
++	printk("maj = %d, min = %d\n", imajor(file_inode(filp)),
++			iminor(file_inode(filp)));
++
++	printk("%s\\n", __func__);
++
++	if (mutex_lock_interruptible(&dev->lock))
++		return -ERESTARTSYS;
++	if (*f_pos >= dev->size)
++		goto out;
++	if (*f_pos + count > dev->size)
++		count = dev->size - *f_pos;
++
++	item = (long)*f_pos / itemsize;
++	rest = (long)*f_pos % itemsize;
++	s_pos = rest / quantum;
++	q_pos = rest % quantum;
++
++	dptr = scull_follow(dev, item);
++
++	if (dptr == NULL || !dptr->data || !dptr->data[s_pos])
++		goto out;
++
++	if (count > quantum - q_pos)
++		count = quantum - q_pos;
++
++	if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count)) {
++		retval = -EFAULT;
++		goto out;
++	}
++
++	*f_pos += count;
++	retval = count;
++
++
++#endif
++
++out:
++	mutex_unlock(&dev->lock);
++	return retval;
++}
++
++ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
++		loff_t *f_pos)
++{
++
++	struct scull_dev *dev = filp->private_data;
++	struct scull_qset *dptr;
++	int quantum = dev->quantum;
++	int qset = dev->qset;
++	int itemsize = quantum * qset;
++	int item, s_pos, q_pos, rest;
++	ssize_t retval = -ENOMEM;
++
++	printk("%s\\n", __func__);
++	printk("maj = %d, min = %d\\n", imajor(file_inode(filp)),
++			iminor(file_inode(filp)));
++
++	if (mutex_lock_interruptible(&dev->lock))
++		return -ERESTARTSYS;
++
++	item = (long)*f_pos / itemsize;
++	rest = (long)*f_pos % itemsize;
++	s_pos = rest / quantum;
++	q_pos = rest % quantum;
++
++	dptr = scull_follow(dev, item);
++	if (dptr == NULL)
++		goto out;
++
++	if (!dptr->data) {
++		dptr->data = kmalloc(qset * sizeof(char*), GFP_KERNEL);
++		if (!dptr->data)
++			goto out;
++		memset(dptr->data, 0, qset * sizeof(char*));
++	}
++	if (!dptr->data[s_pos]) {
++		dptr->data[s_pos] = kmalloc(quantum, GFP_KERNEL);
++		if (!dptr->data[s_pos])
++			goto out;
++	}
++
++	if (count > quantum - q_pos)
++		count = quantum - q_pos;
++
++	if (copy_from_user(dptr->data[s_pos] + q_pos, buf, count)) {
++		retval = -EFAULT;
++		goto out;
++	}
++	*f_pos += count;
++	retval = count;
++
++	if (dev->size < *f_pos)
++		dev->size = *f_pos;
++
++
++out:
++	mutex_unlock(&dev->lock);
++
++	//complete(&my_completion[iminor(file_inode(filp))]);
++	return retval;
++
++
++}
++
++int scull_trim(struct scull_dev *dev)
++{
++	struct scull_qset *next, *dptr;
++	int qset = dev->qset;
++	int i;
++
++	for (dptr = dev->data; dptr; dptr = next) {
++		if (dptr->data) {
++			for (i = 0; i < qset; i++) {
++				kfree(dptr->data[i]);
++				dptr->data[i] = NULL;
++			}
++			kfree(dptr->data);
++			dptr->data = NULL;
++		}
++		next = dptr->next;
++		kfree(dptr);
++	}
++	dev->size = 0;
++	dev->quantum = scull_quantum;
++	dev->qset = scull_qset;
++	dev->data = NULL;
++
++	return 0;
++
++
++}
++
++unsigned int scull_poll(struct file *filp, struct poll_table_struct *wait)
++{
++	static int count = 0;
++	count++;
++	__poll_t mask = 0;
++	poll_wait(filp, &wait_queue_data, wait);
++	printk("Poll function\n");
++
++	if (can_read) {
++		can_read = false;
++		mask |= (POLLIN | POLLRDNORM);
++	}
++
++	if (can_write) {
++		can_write = false;
++		mask |= (POLLOUT | POLLWRNORM);
++	}
++
++	pr_info("mask = %d, count = %d\n", mask, count);
++
++	return mask;
++}
++
++int scull_open(struct inode *inode, struct file *filp)
++{
++	struct scull_dev *dev;
++
++	printk("%s\\n", __func__);
++
++	dev = container_of(inode->i_cdev, struct scull_dev, cdev);
++	filp->private_data = dev;
++
++	if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
++		if (mutex_lock_interruptible(&dev->lock))
++			return -ERESTARTSYS;
++		scull_trim(dev);
++		mutex_unlock(&dev->lock);
++	}
++
++	mutex_lock(&scull_mutex);
++	is_opened[iminor(file_inode(filp))] = true;
++	mutex_unlock(&scull_mutex);
++
++	return 0;
++
++
++}
++
++int scull_release(struct inode *inode, struct file *filp)
++{
++	printk("%s\n", __func__);
++
++	mutex_lock(&scull_mutex);
++	is_opened[iminor(file_inode(filp))] = false;
++	mutex_unlock(&scull_mutex);
++
++	return 0;
++
++
++}
++
++struct file_operations scull_fops = {
++	.owner = THIS_MODULE,
++	//.llseek = scull_llseek,
++	.read = scull_read,
++	.write = scull_write,
++	//.ioctl = scull_ioctl,
++	.open = scull_open,
++	.release = scull_release,
++	.poll = scull_poll,
++};
++
++static void scull_setup_cdev(struct scull_dev *dev, int index)
++{
++	int err, devno = MKDEV(scull_major, scull_minor+index);
++	char buf[50] = {0,};
++	snprintf(buf, 50, "%s%d",DEVICE_NAME, scull_minor+index);
++
++	cdev_init(&dev->cdev, &scull_fops);
++	dev->cdev.owner = THIS_MODULE;
++	dev->cdev.ops = &scull_fops;
++	err = cdev_add(&dev->cdev, devno, 1);
++	if (err)
++		printk(KERN_NOTICE "Error %d adding scull%d", err, index);
++
++	dev->my_class = class_create(THIS_MODULE, buf);
++	dev->my_device  = device_create(dev->my_class, NULL, devno, NULL,
++			"%s", buf);
++
++
++}
++
++static void __exit exit_my_module(void)
++{
++	int i = 0;
++	dev_t devno = MKDEV(scull_major, scull_minor);
++	printk(KERN_INFO "Goodbye my scull driver!\n");
++
++	printk("%s done!\\n", __func__);
++
++	if (scull_devices) {
++		for (i = 0; i < scull_nr_devs; i++) {
++			scull_trim(scull_devices + i);
++			device_destroy(scull_devices[i].my_class, devno + i);
++		}
++	}
++	class_destroy(scull_devices[i].my_class);
++	for (i = 0; i < scull_nr_devs; i++) {
++		cdev_del(&scull_devices[i].cdev);
++	}
++	kfree(scull_devices);
++
++	unregister_chrdev_region(devno, scull_nr_devs);
++
++	timer_exit();
++
++
++	//	scull_p_cleanup();
++	//	scull_access_cleanup();
++}
++
++static int __init init_my_module(void)
++{
++	dev_t dev = 0;
++	int result = 0;
++	int scull_nr_devs = 4;
++	int i = 0;
++
++	printk(KERN_INFO "Hello my scull driver!\\n");
++
++	if (scull_major > 0) {
++		printk(KERN_ERR "scull_major is %d!\\n", scull_major);
++		dev = MKDEV(scull_major, scull_minor);
++		result = register_chrdev_region(dev, scull_nr_devs, "scull");
++	} else {
++		result = alloc_chrdev_region(&dev, scull_minor, scull_nr_devs, "scull");
++		scull_major = MAJOR(dev);
++	}
++
++	if (result < 0) {
++		printk(KERN_ERR "scull : can't get major %d\\n", scull_major);
++	}
++
++	scull_devices = kmalloc(scull_nr_devs * sizeof(struct scull_dev), GFP_KERNEL);
++	if (!scull_devices) {
++		result = -ENOMEM;
++		goto fail;
++	}
++	memset(scull_devices, 0, scull_nr_devs * sizeof(struct scull_dev));
++
++	for (i = 0; i < scull_nr_devs; i++) {
++		scull_devices[i].quantum = scull_quantum;
++		scull_devices[i].qset = scull_qset;
++		mutex_init(&scull_devices[i].lock);
++		scull_setup_cdev(&scull_devices[i], i);
++
++		init_completion(&my_completion[i]);
++	}
++
++	//dev = MKDEV(scull_major, scull_minor + scull_nr_devs);
++	//dev += scull_p_init(dev);
++	//dev += scull_access_init(dev);
++
++	kobj_ref = kobject_create_and_add("scull_sysfs", kernel_kobj);
++
++	if (sysfs_create_file(kobj_ref, &scull_attr.attr)) {
++		pr_info("Cannot create sysfs file....\n");
++		goto r_sysfs;
++	}
++
++	mutex_init(&scull_mutex);
++	timer_init();
++
++	printk("%s : init done!\\n", __func__);
++
++	return result;
++
++r_sysfs:
++	kobject_put(kobj_ref);
++	sysfs_remove_file(kernel_kobj, &scull_attr.attr);
++
++fail:
++	exit_my_module();
++	return result;
++}
++
++struct scull_qset *scull_follow(struct scull_dev *dev, int n)
++{
++	struct scull_qset *qs = dev->data;
++
++	if (!qs) {
++		qs = dev->data = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
++		if (qs == NULL)
++			return NULL;
++		memset(qs, 0, sizeof(struct scull_qset));
++	}
++
++	while(n--) {
++		if (!qs->next) {
++			qs->next = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
++			if (qs->next == NULL)
++				return NULL;
++			memset(qs->next, 0, sizeof(struct scull_qset));
++		}
++		qs = qs->next;
++		continue;
++	}
++
++	return qs;
++
++
++}
++
++static int scull_probe(struct platform_device *pdev)
++{
++	pr_info("scull_probe() function is called\n");
++
++	init_my_module();
++
++	return 0;
++
++
++}
++
++static int __exit scull_remove(struct platform_device *pdev)
++{
++	pr_info("scull_remove() function is called.\n");
++
++	kobject_put(kobj_ref);
++	sysfs_remove_file(kernel_kobj, &scull_attr.attr);
++
++	exit_my_module();
++
++	return 0;
++
++}
++
++static const struct of_device_id my_of_ids[] = {
++	{ .compatible = "platform,scull_driver"},
++	{},
++};
++
++MODULE_DEVICE_TABLE(of, my_of_ids);
++
++static struct platform_driver scull_platform_driver = {
++	.probe = scull_probe,
++	.remove = scull_remove,
++	.driver = {
++		.name = "hello_scull",
++		//.of_match_table = my_of_ids,
++		.owner = THIS_MODULE,
++	}
++};
++
++module_platform_driver(scull_platform_driver);
++
++//module_init(init_my_module);
++//module_exit(exit_my_module);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Chulhyun");
++MODULE_DESCRIPTION("A simple test module");
+diff --git a/drivers/scull/scull.h b/drivers/scull/scull.h
+new file mode 100644
+index 000000000000..8dc0f80d1abc
+--- /dev/null
++++ b/drivers/scull/scull.h
+@@ -0,0 +1,113 @@
++
++
++#ifndef _SCULL_H_
++#define _SCULL_H_
++
++#include <linux/ioctl.h> /* needed for the _IOW etc stuff used later */
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/cdev.h>
++
++
++#ifndef SCULL_MAJOR
++#define SCULL_MAJOR 0   /* dynamic major by default */
++#endif
++
++#ifndef SCULL_NR_DEVS
++#define SCULL_NR_DEVS 4    /* scull0 through scull3 */
++#endif
++
++/*
++ * The bare device is a variable-length region of memory.
++ * Use a linked list of indirect blocks.
++ *
++ * "scull_dev->data" points to an array of pointers, each
++ * pointer refers to a memory area of SCULL_QUANTUM bytes.
++ *
++ * The array (quantum-set) is SCULL_QSET long.
++ */
++#ifndef SCULL_QUANTUM
++#define SCULL_QUANTUM 4000
++#endif
++
++#ifndef SCULL_QSET
++#define SCULL_QSET    1000
++#endif
++
++
++/*
++ * Representation of scull quantum sets.
++ */
++struct scull_qset {
++	void **data;
++	struct scull_qset *next;
++};
++
++struct scull_dev {
++	struct scull_qset *data;  /* Pointer to first quantum set */
++	int quantum;              /* the current quantum size */
++	int qset;                 /* the current array size */
++	unsigned long size;       /* amount of data stored here */
++	unsigned int access_key;  /* used by sculluid and scullpriv */
++	struct mutex lock;     /* mutual exclusion semaphore     */
++	struct cdev cdev;	  /* Char device structure		*/
++	struct class *my_class; 
++	struct device *my_device;
++};
++
++/*
++ * Split minors in two parts
++ */
++#define TYPE(minor)	(((minor) >> 4) & 0xf)	/* high nibble */
++#define NUM(minor)	((minor) & 0xf)		/* low  nibble */
++
++
++
++/*
++ * Prototypes for shared functions
++ */
++
++
++int     scull_trim(struct scull_dev *dev);
++
++ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
++                   loff_t *f_pos);
++ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
++                    loff_t *f_pos);
++loff_t  scull_llseek(struct file *filp, loff_t off, int whence);
++long     scull_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
++
++
++/*
++ * Ioctl definitions
++ */
++
++/* Use 'k' as magic number */
++#define SCULL_IOC_MAGIC  'k'
++/* Please use a different 8-bit number in your code */
++
++#define SCULL_IOCRESET    _IO(SCULL_IOC_MAGIC, 0)
++
++/*
++ * S means "Set" through a ptr,
++ * T means "Tell" directly with the argument value
++ * G means "Get": reply by setting through a pointer
++ * Q means "Query": response is on the return value
++ * X means "eXchange": switch G and S atomically
++ * H means "sHift": switch T and Q atomically
++ */
++#define SCULL_IOCSQUANTUM _IOW(SCULL_IOC_MAGIC,  1, int)
++#define SCULL_IOCSQSET    _IOW(SCULL_IOC_MAGIC,  2, int)
++#define SCULL_IOCTQUANTUM _IO(SCULL_IOC_MAGIC,   3)
++#define SCULL_IOCTQSET    _IO(SCULL_IOC_MAGIC,   4)
++#define SCULL_IOCGQUANTUM _IOR(SCULL_IOC_MAGIC,  5, int)
++#define SCULL_IOCGQSET    _IOR(SCULL_IOC_MAGIC,  6, int)
++#define SCULL_IOCQQUANTUM _IO(SCULL_IOC_MAGIC,   7)
++#define SCULL_IOCQQSET    _IO(SCULL_IOC_MAGIC,   8)
++#define SCULL_IOCXQUANTUM _IOWR(SCULL_IOC_MAGIC, 9, int)
++#define SCULL_IOCXQSET    _IOWR(SCULL_IOC_MAGIC,10, int)
++#define SCULL_IOCHQUANTUM _IO(SCULL_IOC_MAGIC,  11)
++#define SCULL_IOCHQSET    _IO(SCULL_IOC_MAGIC,  12)
++
++
++#endif /* _SCULL_H_ */
+diff --git a/drivers/scull/scull_device.c b/drivers/scull/scull_device.c
+new file mode 100644
+index 000000000000..1a9ec6321362
+--- /dev/null
++++ b/drivers/scull/scull_device.c
+@@ -0,0 +1,46 @@
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/ioport.h>
++#include <linux/platform_device.h>
++
++//Define and initialize the relevant resources of the LED device
++static struct resource scull_resource = 
++{
++    .start = 0xE0200240,
++    .end = 0xE0200240 + 8 - 1,
++    .flags = IORESOURCE_MEM,
++};
++
++
++//Define and initialize LED device information
++static struct platform_device scull_dev = 
++{
++    .name = "hello_scull",             //Equipment name
++    .id = -1,                  //Number of devices, -1 means only one device
++    .num_resources = 1,        //Number of resources
++    .resource = &scull_resource, //Resource pointer
++    .dev = 
++    {
++        //.release = scull_release,
++    },
++};
++
++//Register LED device
++static int __init scull_device_init(void)
++{
++    return platform_device_register(&scull_dev);
++}
++
++//Log off LED device
++static void __exit scull_device_exit(void)
++{
++    platform_device_unregister(&scull_dev);
++}
++
++module_init(scull_device_init);
++module_exit(scull_device_exit);
++
++MODULE_AUTHOR("jch");
++MODULE_DESCRIPTION("scull device for test");
++MODULE_LICENSE("GPL");
