@@ -5,6 +5,8 @@ MODULE_NAME := virt_driver
 ifneq ($(KERNELRELEASE),)
 obj-m += $(MODULE_NAME).o
 
+ccflags-y += -DDEBUG
+
 else
 ARCH ?= arm64
 PWD := $(shell pwd)
