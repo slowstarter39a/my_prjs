@@ -20,5 +20,5 @@ $(LIB_TARGET_A):
 
 clean:
 	rm -rf *.o
-	rm -rf *.a
-	rm -rf *.so*
+	rm -rf $(LIB_TARGET_SO)*
+	rm -rf $(LIB_TARGET_A)*
