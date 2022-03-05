@@ -1,5 +1,6 @@
 
 #include "mymath.h"
+#include "mypow.h"
 
 int addition(int a, int b)
 {
@@ -24,5 +25,10 @@ int division(int a, int b)
 int remainder(int a, int b)
 {
 	return a % b;
+}
+
+int power(int a, int b)
+{
+	return my_pow(a, b);
 }
 

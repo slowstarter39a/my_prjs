@@ -4,7 +4,7 @@ TARGET = calculator
 SRCS = calculator.c
 OBJS = ${SRCS:.c=.o}
 
-LDFLAGS += -lmymath -lmylog
+LDFLAGS += -lmymath -lmylog -lmypow
 
 
 all: $(TARGET)
