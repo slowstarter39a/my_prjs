@@ -26,10 +26,10 @@ PR = "r01"
 
 do_install() {
 	install -d ${D}${libdir}
-	install -m 0755 libmypow.so.1.0 ${D}${libdir}
+	oe_soinstall ${S}/libmypow.so.0.1 ${D}${libdir}
 
 	install -d ${D}${includedir}
-	install -m 0644 *.h ${D}${includedir}
+	install -m 0644 ${S}/*.h ${D}${includedir}
 
 }
 	
